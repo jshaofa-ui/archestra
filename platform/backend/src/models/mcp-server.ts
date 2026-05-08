@@ -469,20 +469,20 @@ class McpServerModel {
     }
 
     // Clean up agent_tools that reference this server
-    // Must be done before deletion to ensure agents do not retain unusable tool assignments
-    // FK constraint would only null out the reference, not remove the assignment
+    // FIX for #4423: NULL out mcpServerId instead of deleting agent-tool assignments.
+    // This preserves the agent-tool assignment so the tool remains assigned to the agent
+    // (just without a credential source), allowing re-assignment when credentials are re-created.
+    // Previously, deleteByExecutionSourceMcpServerId() performed a hard DELETE,
+    // permanently removing all agent-tool assignments when an MCP server was deleted.
+    // The FK constraint onDelete: "set null" would handle this automatically,
+    // but the explicit delete call was overriding it with a hard delete.
     try {
-      let deletedAgentTools = 0;
-      if (mcpServer.serverType === "local") {
-        deletedAgentTools =
-          await AgentToolModel.deleteByExecutionSourceMcpServerId(id);
-      } else {
-        deletedAgentTools =
-          await AgentToolModel.deleteByCredentialSourceMcpServerId(id);
-      }
-      if (deletedAgentTools > 0) {
+      let nullifiedAgentTools = 0;
+      // Both local and remote servers use the same nullify method
+      nullifiedAgentTools = await AgentToolModel.nullifyMcpServerId(id);
+      if (nullifiedAgentTools > 0) {
         logger.info(
-          `Deleted ${deletedAgentTools} agent tool assignments for MCP server: ${mcpServer.name}`,
+          `Nullified ${nullifiedAgentTools} agent tool mcpServerId references for MCP server: ${mcpServer.name}`,
         );
       }
     } catch (error) {
