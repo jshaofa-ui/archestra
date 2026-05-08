@@ -152,9 +152,41 @@ export async function autoReinstallServer(
     teamId: server.teamId,
   });
 
-  // Update server name in DB BEFORE restart so the new K8s deployment
-  // gets the correct name. restartServer reads from DB to create the new deployment.
-  if (reconstructedName !== server.name) {
+  // FIX for #4328: Stop old deployment BEFORE renaming when name changes.
+  // The bug: if we update the name first, then restartServer() calls stopServer()
+  // which uses getOrLoadDeployment() to find the deployment by name. But the DB
+  // already has the NEW name, so the old deployment (with OLD name) is not found
+  // and not deleted. Then startServer() creates a new deployment → orphaned old pod.
+  // Solution: stop the old deployment first (while DB still has old name), then rename.
+  const nameChanged = reconstructedName !== server.name;
+  if (nameChanged && catalogItem.serverType === "local") {
+    logger.info(
+      {
+        serverId: server.id,
+        oldName: server.name,
+        newName: reconstructedName,
+      },
+      "Server name changed — stopping old deployment before rename",
+    );
+    // Stop the old deployment while the DB still has the old server name
+    // This ensures stopServer can find the deployment by the old name
+    try {
+      await McpServerRuntimeManager.stopServer(server.id);
+      logger.info(
+        { serverId: server.id, oldName: server.name },
+        "Old deployment stopped successfully",
+      );
+    } catch (error) {
+      logger.warn(
+        { err: error, serverId: server.id },
+        "Failed to stop old deployment before rename — will attempt cleanup after restart",
+      );
+      // Continue — restartServer will attempt to create a new deployment
+    }
+  }
+
+  // Update server name in DB
+  if (nameChanged) {
     logger.info(
       {
         serverId: server.id,
@@ -166,9 +198,16 @@ export async function autoReinstallServer(
     await McpServerModel.update(server.id, { name: reconstructedName });
   }
 
-  // For local servers: restart K8s deployment
+  // For local servers: start K8s deployment (with new name if changed)
   if (catalogItem.serverType === "local") {
-    await McpServerRuntimeManager.restartServer(server.id);
+    // Re-fetch server to get updated name if it changed
+    const updatedServer = nameChanged
+      ? await McpServerModel.findById(server.id)
+      : server;
+    if (!updatedServer) {
+      throw new Error(`MCP server ${server.id} not found after name update`);
+    }
+    await McpServerRuntimeManager.startServer(updatedServer);
 
     // Wait for deployment to be ready
     const deployment = await McpServerRuntimeManager.getOrLoadDeployment(
