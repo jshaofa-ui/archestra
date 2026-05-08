@@ -149,6 +149,10 @@ export class McpServerRuntimeManager {
           "Failed to backfill team-id labels on regcred secrets",
         );
       });
+
+      this.cleanupOrphanedDeployments(installedServers).catch((err) => {
+        logger.warn({ err }, "Failed to cleanup orphaned MCP deployments");
+      });
     } catch (error: unknown) {
       const errorMsg = error instanceof Error ? error.message : "Unknown error";
       logger.error(`Failed to initialize MCP Server Runtime: ${errorMsg}`);
@@ -544,6 +548,17 @@ export class McpServerRuntimeManager {
       // "Session not found" errors for in-flight conversations.
       await McpHttpSessionModel.deleteByMcpServerId(mcpServerId);
 
+        // Check if this is a shared multi-tenant deployment
+      const isShared = await McpServerRuntimeManager.isSharedMultitenantDeployment(mcpServerId);
+      
+      if (isShared) {
+        // For shared deployments, use rolling restart instead of stop/start
+        // stopServer() skips teardown for shared deployments, and startServer()
+        // would fail because the deployment already exists
+        logger.info(`Using rolling restart for shared multi-tenant deployment: ${mcpServerId}`);
+        return this.restartSharedDeployment(mcpServerId);
+      }
+
       // Stop the deployment
       await this.stopServer(mcpServerId);
 
@@ -563,6 +578,80 @@ export class McpServerRuntimeManager {
       );
       throw error;
     }
+
+  /**
+   * Restart a shared multi-tenant deployment using K8s rolling restart.
+   * FIX for #4429: When a multi-tenant MCP server has 2+ credentials and its
+   * configuration is updated, stopServer() skips teardown (because other
+   * callers share the deployment), and startServer() creates a duplicate.
+   * This method performs a rolling restart by patching the deployment annotation,
+   * which triggers K8s to recreate all pods with updated config.
+   */
+  async restartSharedDeployment(mcpServerId: string): Promise<void> {
+    logger.info(`Restarting shared multi-tenant deployment: ${mcpServerId}`);
+
+    const mcpServer = await McpServerModel.findById(mcpServerId);
+    if (!mcpServer?.catalogId) {
+      throw new Error("Server is not a multi-tenant catalog server");
+    }
+
+    const isShared = await McpServerRuntimeManager.isSharedMultitenantDeployment(mcpServerId);
+    if (!isShared) {
+      // Not a shared deployment, use normal restart
+      return this.restartServer(mcpServerId);
+    }
+
+    // Get the shared deployment name
+    const k8sDeployment = await this.getOrLoadDeployment(mcpServerId);
+    if (!k8sDeployment) {
+      throw new Error(`No deployment found for MCP server ${mcpServerId}`);
+    }
+
+    const deploymentName = k8sDeployment.getDeploymentName?.() 
+      || `mcp-${mcpServerId.substring(0, 8)}`;
+
+    try {
+      // Perform a rolling restart by patching the deployment annotation
+      // This triggers K8s to recreate all pods with updated config
+      // without deleting the deployment (which would affect other callers)
+      const body = {
+        spec: {
+          template: {
+            metadata: {
+              annotations: {
+                "archestra.ai/restartedAt": new Date().toISOString(),
+              },
+            },
+          },
+        },
+      };
+
+      await this.k8sAppsApi.patchNamespacedDeployment(
+        deploymentName,
+        this.namespace,
+        body,
+        undefined,
+        undefined,
+        undefined,
+        { fieldManager: "archestra-mcp-server" },
+      );
+
+      logger.info(
+        `Triggered rolling restart for shared deployment ${deploymentName}`,
+      );
+
+      // Clean up stored HTTP session IDs (same as restartServer)
+      await McpHttpSessionModel.deleteByMcpServerId(mcpServerId);
+    } catch (error) {
+      logger.error(
+        { err: error },
+        `Failed to restart shared deployment ${deploymentName}:`,
+      );
+      throw error;
+    }
+  }
+
+
   }
 
   /**
@@ -909,6 +998,93 @@ export class McpServerRuntimeManager {
         { err: error },
         "Failed to list secrets for team-id backfill",
       );
+    }
+  }
+
+  /**
+   * Sweep deployments whose names no longer match the current name produced by
+   * K8sDeployment.constructDeploymentName for their owning server.
+   */
+  private async cleanupOrphanedDeployments(
+    installedServers: McpServer[],
+  ): Promise<void> {
+    if (!this.k8sApi || !this.k8sAppsApi) return;
+
+    const serverById = new Map<string, McpServer>();
+    for (const server of installedServers) {
+      serverById.set(server.id, server);
+    }
+
+    const catalogCache = new Map<
+      string,
+      Awaited<ReturnType<typeof InternalMcpCatalogModel.findById>>
+    >();
+    const getCatalog = async (catalogId: string | null | undefined) => {
+      if (!catalogId) return null;
+      if (catalogCache.has(catalogId)) {
+        return catalogCache.get(catalogId) ?? null;
+      }
+      const catalog = await InternalMcpCatalogModel.findById(catalogId);
+      catalogCache.set(catalogId, catalog);
+      return catalog;
+    };
+
+    try {
+      const deployments = await this.k8sAppsApi.listNamespacedDeployment({
+        namespace: this.namespace,
+        labelSelector: "app=mcp-server",
+      });
+
+      for (const deployment of deployments.items) {
+        const labels = deployment.metadata?.labels;
+        const deploymentName = deployment.metadata?.name;
+        if (!labels || !deploymentName) continue;
+
+        const serverId = labels["mcp-server-id"];
+        if (!serverId) continue;
+
+        const server = serverById.get(serverId);
+        if (!server) continue;
+
+        const catalog = await getCatalog(server.catalogId);
+        const expectedName = K8sDeployment.constructDeploymentName(
+          server,
+          catalog,
+        );
+
+        if (deploymentName === expectedName) continue;
+
+        logger.info(
+          { deploymentName, expectedName, serverId },
+          "Deleting orphaned MCP deployment with stale name",
+        );
+
+        try {
+          await this.k8sAppsApi.deleteNamespacedDeployment({
+            name: deploymentName,
+            namespace: this.namespace,
+          });
+        } catch (err) {
+          logger.warn(
+            { err, deploymentName },
+            "Failed to delete orphaned MCP deployment",
+          );
+        }
+
+        try {
+          await this.k8sApi.deleteNamespacedService({
+            name: `${deploymentName}-service`,
+            namespace: this.namespace,
+          });
+        } catch (err) {
+          logger.debug(
+            { err, deploymentName },
+            "No orphaned service to delete (or already gone)",
+          );
+        }
+      }
+    } catch (error) {
+      logger.warn({ err: error }, "Failed to sweep orphaned MCP deployments");
     }
   }
 
