@@ -28,13 +28,19 @@ export function AppLogo({ centered = true }: AppLogoProps) {
     return (
       <div className={`flex ${centered ? "justify-center" : "pl-8"}`}>
         <div className="flex flex-col items-center gap-1">
-          <Image
-            src={effectiveLogo}
-            alt="Organization logo"
-            width={200}
-            height={60}
-            className="object-contain h-12 w-auto max-w-[calc(100vw-6rem)]"
-          />
+          {/* FIX for #4432: Wrap logo in a constrained container to handle
+              non-standard aspect ratios. The container enforces h-12 (48px) height
+              and max-w-full width, while the image uses h-full + w-auto + max-w-full
+              to scale proportionally without overflowing. */}
+          <div className="relative h-12 w-full max-w-[calc(100vw-6rem)] flex items-center justify-center overflow-hidden">
+            <Image
+              src={effectiveLogo}
+              alt="Organization logo"
+              width={200}
+              height={60}
+              className="h-full w-auto object-contain max-w-full"
+            />
+          </div>
           {!config.enterpriseFeatures.fullWhiteLabeling && (
             <p className="text-[10px] text-muted-foreground">
               Powered by {DEFAULT_APP_NAME}
