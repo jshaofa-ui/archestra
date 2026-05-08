@@ -532,13 +532,50 @@ class McpServerModel {
         );
 
         if (remainingServers.length === 0) {
-          // No more servers for this catalog, delete all tools
+          // FIX for #4433: Preserve tool invocation policies before deleting tools
+          // When tools are deleted, their invocation policies are CASCADE-deleted.
+          // Save them now so they can be restored when tools are re-created.
+          const preservedPolicies = await db
+            .select({
+              toolName: schema.toolsTable.name,
+              policyId: schema.toolInvocationPoliciesTable.id,
+              policyData: schema.toolInvocationPoliciesTable.policy,
+            })
+            .from(schema.toolInvocationPoliciesTable)
+            .innerJoin(
+              schema.toolsTable,
+              eq(schema.toolInvocationPoliciesTable.toolId, schema.toolsTable.id),
+            )
+            .where(eq(schema.toolsTable.catalogId, mcpServer.catalogId));
+
+          logger.info(
+            `Preserved ${preservedPolicies.length} tool invocation policies for catalog ${mcpServer.catalogId}`,
+          );
+
+          // Delete tools (policies will cascade-delete, but we have the data)
           const deletedToolsCount = await ToolModel.deleteByCatalogId(
             mcpServer.catalogId,
           );
           logger.info(
             `Deleted ${deletedToolsCount} tools for catalog ${mcpServer.catalogId} (last installation removed)`,
           );
+
+          // Store preserved policies in catalog metadata for restoration
+          // When tools are re-provisioned, they will be matched by tool name
+          if (preservedPolicies.length > 0) {
+            await InternalMcpCatalogModel.update(mcpServer.catalogId, {
+              metadata: {
+                preservedToolPolicies: preservedPolicies.map(p => ({
+                  toolName: p.toolName,
+                  policy: p.policyData,
+                })),
+                preservedAt: new Date().toISOString(),
+              },
+            });
+            logger.info(
+              `Stored ${preservedPolicies.length} preserved policies in catalog metadata for restoration`,
+            );
+          }
         }
       } catch (error) {
         logger.error(
